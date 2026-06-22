@@ -1,0 +1,19 @@
+[package]
+name = "nix-process"
+version = "0.1.0"
+edition = "2021"
+description = "A TUI-less process manager for services defined in a flake.nix"
+license = "MIT"
+
+[[bin]]
+name = "nix-process"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+signal-hook = "0.3"
+
+[profile.release]
+strip = true

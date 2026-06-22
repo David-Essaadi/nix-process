@@ -1,0 +1,5 @@
+/target
+/result
+/result-*
+.nix-process/
+example/.nix-process/
