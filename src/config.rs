@@ -66,24 +66,57 @@ pub struct Config {
     pub processes: BTreeMap<String, Process>,
 }
 
+/// A declared one-off command (a "test") plus the services it needs running.
+/// nix-process brings up the transitive closure of `services`, runs `command`,
+/// then tears the services down and returns the command's exit code.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestSpec {
+    #[serde(skip)]
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Evaluate `nix eval <flake>#<attr> --json` and return the raw JSON bytes.
+fn nix_eval_json(flake: &str, attr: &str) -> Result<Vec<u8>, String> {
+    let reference = format!("{flake}#{attr}");
+    let out = Command::new("nix")
+        .args(["eval", &reference, "--json"])
+        .output()
+        .map_err(|e| format!("failed to run `nix eval`: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("`nix eval {reference}` failed:\n{}", stderr.trim()));
+    }
+    Ok(out.stdout)
+}
+
+/// Evaluate `nix eval <flake>#<attr> --json` into the map of declared tests.
+pub fn load_tests(flake: &str, attr: &str) -> Result<BTreeMap<String, TestSpec>, String> {
+    let data = nix_eval_json(flake, attr)?;
+    let mut tests: BTreeMap<String, TestSpec> = serde_json::from_slice(&data)
+        .map_err(|e| format!("parsing `{flake}#{attr}` as a test map: {e}"))?;
+    for (name, t) in tests.iter_mut() {
+        t.name = name.clone();
+        if t.command.trim().is_empty() {
+            return Err(format!("test {name:?} has an empty command"));
+        }
+    }
+    Ok(tests)
+}
+
 impl Config {
     /// Evaluate `nix eval <flake>#<attr> --json` and parse it.
     pub fn load(flake: &str, attr: &str) -> Result<Config, String> {
-        let reference = format!("{flake}#{attr}");
-        let out = Command::new("nix")
-            .args(["eval", &reference, "--json"])
-            .output()
-            .map_err(|e| format!("failed to run `nix eval`: {e}"))?;
-
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("`nix eval {reference}` failed:\n{}", stderr.trim()));
-        }
-
+        let data = nix_eval_json(flake, attr)?;
         // The attribute itself is the process map.
-        let processes: BTreeMap<String, Process> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("parsing `{reference}` as a process map: {e}"))?;
-
+        let processes: BTreeMap<String, Process> = serde_json::from_slice(&data)
+            .map_err(|e| format!("parsing `{flake}#{attr}` as a process map: {e}"))?;
         Config::from_processes(processes)
     }
 
@@ -104,14 +137,21 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Return process names in a valid start order honoring `depends_on`.
+    /// Return all process names in a valid start order honoring `depends_on`.
     /// Errors on cycles or references to undefined processes. Deterministic
     /// because `processes` is a BTreeMap (sorted keys).
     pub fn start_order(&self) -> Result<Vec<String>, String> {
-        let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
-        let mut order: Vec<String> = Vec::with_capacity(self.processes.len());
+        let all: Vec<String> = self.processes.keys().cloned().collect();
+        self.start_order_from(&all)
+    }
 
-        for root in self.processes.keys() {
+    /// Return the deps-first start order of `roots` plus their transitive
+    /// `depends_on` closure — i.e. exactly the processes needed to bring `roots`
+    /// up, nothing else. Deterministic and cycle/undefined-dep checked.
+    pub fn start_order_from(&self, roots: &[String]) -> Result<Vec<String>, String> {
+        let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for root in roots {
             self.visit(root, &mut marks, &mut order)?;
         }
         Ok(order)

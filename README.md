@@ -86,15 +86,37 @@ Set exactly one probe:
 
 Plus optional `timeout_seconds` (default 60) and `interval_seconds` (default 1).
 
+## Tests (run a command with services up)
+
+Declare one-off commands that need some services running — tests, seeds, a
+console. nix-process brings up the **transitive closure** of the named services
+(dep-ordered, health-gated), runs the command in the foreground, then tears the
+services down and exits with the command's status. This is the `devenv test` /
+`process-compose run` capability.
+
+```nix
+tests.backend = {
+  command = "mix test";        # run with inherited stdio (raw, interactive)
+  services = [ "db" ];         # db (+ its depends_on) brought up first
+  # cwd / env optional
+};
+```
+
+```sh
+nix-process test backend       # db up → mix test → db down; exits with mix's code
+```
+
 ## Usage
 
 ```
-nix-process up [flags]      start all processes and supervise them
-nix-process down [flags]    clean up orphaned processes from a prior run
+nix-process up [flags]           start all processes and supervise them
+nix-process test <name> [flags]  bring up a test's services, run it, tear down
+nix-process down [flags]         clean up orphaned processes from a prior run
 
 Flags:
   --flake <ref>      flake reference (default ".")
   --attr <attr>      attribute holding the process map (default "processes")
+  --tests-attr <a>   attribute holding the test map (default "tests")
   --grace-seconds N  seconds to wait after SIGTERM before SIGKILL (default 10)
   --state <path>     state file path (default ".nix-process/state.json")
 ```

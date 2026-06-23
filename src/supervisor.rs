@@ -1,7 +1,7 @@
 //! The supervisor: starts processes in dependency order, waits for health,
 //! streams their output, and guarantees they are all torn down.
 
-use crate::config::{Config, Process};
+use crate::config::{Config, Process, TestSpec};
 use crate::health::wait_healthy;
 use crate::log::Logger;
 use crate::proc::{killpg, spawn_in_own_group};
@@ -85,24 +85,26 @@ impl Supervisor {
         Arc::clone(&self.procs)
     }
 
-    /// Start everything and supervise until shutdown. Returns a process exit code.
-    pub fn run(&mut self) -> i32 {
-        let order = match self.cfg.start_order() {
-            Ok(o) => o,
-            Err(e) => {
-                self.log.system(&format!("config error: {e}"));
-                return 1;
-            }
-        };
-        let total = order.len();
+    /// Start the processes in `order` (deps first), gating each on its
+    /// dependencies becoming ready. On any failure it shuts everything down and
+    /// returns `Err(exit_code)`. `healthy`/`exited` carry readiness state for a
+    /// caller that goes on to supervise or run a command.
+    fn start_all(
+        &mut self,
+        order: &[String],
+        healthy: &mut HashSet<String>,
+        exited: &mut HashSet<String>,
+    ) -> Result<(), i32> {
         let processes = self.cfg.processes.clone();
-
-        let mut healthy: HashSet<String> = HashSet::new();
-        let mut exited: HashSet<String> = HashSet::new();
-
-        // --- Startup: launch in dependency order, gating on each dep's health.
-        for name in &order {
-            let p = processes[name].clone();
+        for name in order {
+            let p = match processes.get(name) {
+                Some(p) => p.clone(),
+                None => {
+                    self.log.system(&format!("process {name:?} is not defined"));
+                    self.shutdown();
+                    return Err(1);
+                }
+            };
 
             for dep in &p.depends_on {
                 while !healthy.contains(dep) {
@@ -111,16 +113,14 @@ impl Supervisor {
                             "{dep:?} exited before becoming healthy; aborting startup"
                         ));
                         self.shutdown();
-                        return 1;
+                        return Err(1);
                     }
                     match self.rx.recv() {
                         Ok(ev) => {
-                            if let Control::Stop { reason, code } =
-                                self.apply(ev, &mut healthy, &mut exited)
-                            {
+                            if let Control::Stop { reason, code } = self.apply(ev, healthy, exited) {
                                 self.log.system(&format!("aborting startup: {reason}"));
                                 self.shutdown();
-                                return code;
+                                return Err(code);
                             }
                         }
                         Err(_) => break,
@@ -131,8 +131,28 @@ impl Supervisor {
             if let Err(e) = self.spawn_process(&p) {
                 self.log.system(&format!("failed to start {name:?}: {e}"));
                 self.shutdown();
+                return Err(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start everything and supervise until shutdown. Returns a process exit code.
+    pub fn run(&mut self) -> i32 {
+        let order = match self.cfg.start_order() {
+            Ok(o) => o,
+            Err(e) => {
+                self.log.system(&format!("config error: {e}"));
                 return 1;
             }
+        };
+        let total = order.len();
+
+        let mut healthy: HashSet<String> = HashSet::new();
+        let mut exited: HashSet<String> = HashSet::new();
+
+        if let Err(code) = self.start_all(&order, &mut healthy, &mut exited) {
+            return code;
         }
 
         self.log.system(&format!("all {total} processes started"));
@@ -160,6 +180,56 @@ impl Supervisor {
 
         self.shutdown();
         exit_code
+    }
+
+    /// Bring up the service subset in `order` (deps first), run the test command,
+    /// then tear the services down. Returns the command's exit code; if the
+    /// services fail to start, returns non-zero without running the command.
+    pub fn run_test(&mut self, order: Vec<String>, test: &TestSpec) -> i32 {
+        let mut healthy: HashSet<String> = HashSet::new();
+        let mut exited: HashSet<String> = HashSet::new();
+
+        if !order.is_empty() {
+            if let Err(code) = self.start_all(&order, &mut healthy, &mut exited) {
+                return code;
+            }
+            self.log.system(&format!(
+                "{} service(s) ready; running test {:?}",
+                order.len(),
+                test.name
+            ));
+        } else {
+            self.log.system(&format!("running test {:?}", test.name));
+        }
+
+        // Run the command in the foreground with inherited stdio (raw output,
+        // interactive, terminal signals reach it directly). It shares our process
+        // group; the services keep their own groups for clean teardown.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&test.command);
+        if let Some(cwd) = &test.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (k, v) in &test.env {
+            cmd.env(k, v);
+        }
+
+        let code = match cmd.status() {
+            Ok(status) => status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+            Err(e) => {
+                self.log.system(&format!("failed to run test command: {e}"));
+                1
+            }
+        };
+
+        self.log.system(&format!(
+            "test {:?} finished (exit {code}); stopping services",
+            test.name
+        ));
+        self.shutdown();
+        code
     }
 
     /// Apply one event to our view of the world.
