@@ -193,6 +193,28 @@ impl Supervisor {
             if let Err(code) = self.start_all(&order, &mut healthy, &mut exited) {
                 return code;
             }
+
+            // `start_all` only gates each service on its declared `depends_on`, so
+            // a leaf service (one nothing depends on) is spawned but never waited
+            // for. Block until every service we brought up has passed its health
+            // check before running the test, so the command never races a service
+            // that is still starting up (e.g. an emulator that reports "device is
+            // still booting" because boot has not completed).
+            while healthy.len() < order.len() {
+                match self.rx.recv() {
+                    Ok(ev) => {
+                        if let Control::Stop { reason, code } =
+                            self.apply(ev, &mut healthy, &mut exited)
+                        {
+                            self.log.system(&format!("aborting startup: {reason}"));
+                            self.shutdown();
+                            return code;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
             self.log.system(&format!(
                 "{} service(s) ready; running test {:?}",
                 order.len(),
