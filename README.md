@@ -18,6 +18,11 @@ A small, TUI-less process manager for services defined in a `flake.nix` — like
   the next `up` reaps any orphaned groups left behind (guarding against PID
   reuse via the process start time in `/proc`).
 
+The flake is evaluated **impurely** (`nix eval … --impure`), so your `processes`
+and `tests` may branch on the environment — e.g. `builtins.getEnv "CI"` to add
+CI-only services, or reading env to configure docker services. Flake inputs stay
+locked; impurity only unlocks env / `builtins.currentSystem` reads.
+
 ## Defining processes
 
 In your `flake.nix`:

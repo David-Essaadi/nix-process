@@ -83,10 +83,15 @@ pub struct TestSpec {
 }
 
 /// Evaluate `nix eval <flake>#<attr> --json` and return the raw JSON bytes.
+///
+/// The eval is `--impure` so process/test definitions can branch on the
+/// environment — e.g. `builtins.getEnv "CI"` to add CI-only services, or reading
+/// env to configure docker services. Flake inputs are still locked; impurity only
+/// unlocks env / `builtins.currentSystem` reads.
 fn nix_eval_json(flake: &str, attr: &str) -> Result<Vec<u8>, String> {
     let reference = format!("{flake}#{attr}");
     let out = Command::new("nix")
-        .args(["eval", &reference, "--json"])
+        .args(["eval", &reference, "--json", "--impure"])
         .output()
         .map_err(|e| format!("failed to run `nix eval`: {e}"))?;
     if !out.status.success() {
