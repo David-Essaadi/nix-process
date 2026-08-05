@@ -4,12 +4,13 @@
 use crate::config::{Config, Process, TestSpec};
 use crate::health::wait_healthy;
 use crate::log::Logger;
-use crate::proc::{killpg, spawn_in_own_group};
+use crate::proc::{killpg, openpty, spawn_with_pty};
 use crate::state::State;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{mpsc, Arc, Mutex};
@@ -329,13 +330,22 @@ impl Supervisor {
         for (k, v) in &p.env {
             cmd.env(k, v);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        spawn_in_own_group(&mut cmd);
+        // Give the process a terminal rather than a pipe, so it keeps its own
+        // colouring and line buffering. stdout and stderr both land on the pty,
+        // which is what we want here — they were already interleaved into a
+        // single prefixed stream anyway.
+        let (cols, rows) = crate::log::child_winsize();
+        let pty = openpty(cols, rows).map_err(|e| format!("openpty: {e}"))?;
+        spawn_with_pty(&mut cmd, &pty.slave).map_err(|e| e.to_string())?;
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        // Drop every parent-side copy of the slave: read() on the master only
+        // reports EOF once no one else holds the terminal open.
+        drop(cmd);
+        drop(pty.slave);
+
         let pid = child.id() as i32;
-        let pgid = pid; // setpgid(0,0) makes the child its own group leader
+        let pgid = pid; // setsid() makes the child its own group leader
 
         self.state.record(&p.name, pid, pgid);
         self.procs.lock().unwrap().insert(
@@ -347,13 +357,8 @@ impl Supervisor {
             },
         );
 
-        // Stream stdout and stderr, line by line, with a name prefix.
-        if let Some(out) = child.stdout.take() {
-            pump(out, p.name.clone(), self.log.clone());
-        }
-        if let Some(err) = child.stderr.take() {
-            pump(err, p.name.clone(), self.log.clone());
-        }
+        // Stream the terminal's output, line by line, with a name prefix.
+        pump(File::from(pty.master), p.name.clone(), self.log.clone());
 
         // Health-check thread. A oneshot has no health check — its readiness is
         // signalled by a successful exit (handled in the reaper / apply()).
@@ -480,6 +485,10 @@ impl Supervisor {
 }
 
 /// Spawn a thread that forwards each line of `reader` to the logger.
+///
+/// The reader is a pty master, so the terminal's ONLCR gives us CRLF endings —
+/// `lines()` strips both. Once the last slave fd closes, Linux reports EIO
+/// rather than a clean EOF; either way we are done, so any error ends the pump.
 fn pump<R: std::io::Read + Send + 'static>(reader: R, name: String, log: Logger) {
     thread::spawn(move || {
         let buf = BufReader::new(reader);

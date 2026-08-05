@@ -1,23 +1,106 @@
-//! Low-level process-group primitives via libc.
+//! Low-level process-group and pseudo-terminal primitives via libc.
 
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-/// Configure a Command so the spawned child becomes the leader of a brand-new
-/// process group (its pgid == its pid). This lets us signal the whole tree —
-/// including any grandchildren — with a single `killpg`.
-pub fn spawn_in_own_group(cmd: &mut Command) {
-    // SAFETY: pre_exec runs in the forked child before exec. setpgid is
-    // async-signal-safe and we touch no other shared state.
+/// A freshly allocated pseudo-terminal pair. The child gets `slave` as all three
+/// of its standard streams; we read its output from `master`.
+pub struct Pty {
+    pub master: OwnedFd,
+    pub slave: OwnedFd,
+}
+
+/// Allocate a pty sized to `cols` x `rows`.
+///
+/// We give each process a pty rather than a pipe so that it sees a terminal:
+/// most tooling checks `isatty` and silently drops its ANSI colouring (and
+/// switches to 4KB block buffering) when it thinks it is writing to a file.
+pub fn openpty(cols: u16, rows: u16) -> io::Result<Pty> {
+    let mut master = 0;
+    let mut slave = 0;
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty writes two valid fds through the out-params on success;
+    // we pass a null name/termios (defaults) and a fully initialised winsize.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openpty succeeded, so both fds are freshly opened and owned by us.
+    let pty = unsafe {
+        Pty {
+            master: OwnedFd::from_raw_fd(master),
+            slave: OwnedFd::from_raw_fd(slave),
+        }
+    };
+
+    // Mark both close-on-exec. Command dups the slave onto fds 0/1/2 (which
+    // clears the flag on the dups), so the child still gets its terminal — but
+    // without this, every later process would inherit stray master/slave fds and
+    // hold this pty open, so we would never see EOF when this process exits.
+    set_cloexec(&pty.master)?;
+    set_cloexec(&pty.slave)?;
+    Ok(pty)
+}
+
+fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: fd is a live descriptor we own for the duration of the call.
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Configure a Command to run in a brand-new session with `slave` as its
+/// controlling terminal and its stdout/stderr.
+///
+/// stdin is deliberately `/dev/null`, not the terminal: a supervised process has
+/// nobody to type at it, so a read on the pty would block forever. With
+/// /dev/null a read returns EOF at once, so anything that prompts fails fast and
+/// tools that probe `isatty(0)` correctly decide they are non-interactive.
+/// `isatty` on stdout/stderr still holds, which is what drives colouring.
+///
+/// `setsid` also makes the child a process-group leader (pgid == pid), so a
+/// single `killpg` still reaches the whole tree, grandchildren included.
+pub fn spawn_with_pty(cmd: &mut Command, slave: &OwnedFd) -> io::Result<()> {
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(slave.try_clone()?));
+    cmd.stderr(Stdio::from(slave.try_clone()?));
+
+    // The fd stays valid in the forked child: it is close-on-exec, and pre_exec
+    // runs before the exec that would close it.
+    let slave_fd = slave.as_raw_fd();
+
+    // SAFETY: pre_exec runs in the forked child before exec. setsid and ioctl
+    // are async-signal-safe and we touch no other shared state.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Claim the pty as the controlling terminal of the new session.
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
+    Ok(())
 }
 
 /// Send a signal to an entire process group (negative pid semantics).

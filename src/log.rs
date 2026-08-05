@@ -47,14 +47,16 @@ impl Logger {
         c
     }
 
-    /// Print one line of process output.
+    /// Print one line of process output. `line` may contain the process's own
+    /// ANSI codes; we reset after it so unterminated attributes cannot bleed
+    /// into the next process's prefix.
     pub fn line(&self, name: &str, line: &str) {
         let prefix = pad(name);
         let stdout = std::io::stdout();
         let mut h = stdout.lock();
         if self.colors {
             let color = self.color_for(name);
-            let _ = writeln!(h, "{color}{prefix}{RESET} | {line}");
+            let _ = writeln!(h, "{color}{prefix}{RESET} | {line}{RESET}");
         } else {
             let _ = writeln!(h, "{prefix} | {line}");
         }
@@ -87,4 +89,18 @@ fn pad(name: &str) -> String {
 fn stdout_is_tty() -> bool {
     // SAFETY: isatty just inspects a file descriptor.
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+/// Size to give a child process's pty: our own terminal, minus the columns we
+/// spend on the `name | ` prefix, so the child's own wrapping lines up with the
+/// space it actually gets. Falls back to 80x24 when we aren't on a terminal.
+pub fn child_winsize() -> (u16, u16) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ fills the winsize we hand it; a failure leaves it zeroed.
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc != 0 || ws.ws_col == 0 || ws.ws_row == 0 {
+        return (80, 24);
+    }
+    let overhead = (PREFIX_WIDTH + 3) as u16; // prefix plus " | "
+    (ws.ws_col.saturating_sub(overhead).max(20), ws.ws_row)
 }
