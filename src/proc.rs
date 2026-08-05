@@ -67,7 +67,7 @@ fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
 }
 
 /// Configure a Command to run in a brand-new session with `slave` as its
-/// controlling terminal and its stdout/stderr.
+/// stdout/stderr.
 ///
 /// stdin is deliberately `/dev/null`, not the terminal: a supervised process has
 /// nobody to type at it, so a read on the pty would block forever. With
@@ -77,24 +77,29 @@ fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
 ///
 /// `setsid` also makes the child a process-group leader (pgid == pid), so a
 /// single `killpg` still reaches the whole tree, grandchildren included.
+///
+/// We deliberately do NOT claim the pty as the session's controlling terminal
+/// (`TIOCSCTTY`). Colouring only needs `isatty` on stdout/stderr, which the pty
+/// already provides, so a controlling terminal buys nothing — and it re-arms the
+/// job-control machinery we want to stay clear of:
+///
+/// * Once a session leader owns a controlling terminal, the kernel sends SIGHUP
+///   to the foreground process group when that leader exits or the terminal
+///   hangs up. Any program that re-execs, or forks a worker and lets the
+///   original process go, then has its real work killed by SIGHUP. The Android
+///   emulator launcher does exactly that, and died ~1ms after exec.
+/// * With no controlling terminal, SIGTTIN/SIGTTOU cannot be raised at all —
+///   the right posture for a process nobody can type at.
 pub fn spawn_with_pty(cmd: &mut Command, slave: &OwnedFd) -> io::Result<()> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(slave.try_clone()?));
     cmd.stderr(Stdio::from(slave.try_clone()?));
 
-    // The fd stays valid in the forked child: it is close-on-exec, and pre_exec
-    // runs before the exec that would close it.
-    let slave_fd = slave.as_raw_fd();
-
-    // SAFETY: pre_exec runs in the forked child before exec. setsid and ioctl
-    // are async-signal-safe and we touch no other shared state.
+    // SAFETY: pre_exec runs in the forked child before exec. setsid is
+    // async-signal-safe and we touch no other shared state.
     unsafe {
-        cmd.pre_exec(move || {
+        cmd.pre_exec(|| {
             if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // Claim the pty as the controlling terminal of the new session.
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
