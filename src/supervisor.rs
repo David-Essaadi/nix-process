@@ -139,8 +139,15 @@ impl Supervisor {
     }
 
     /// Start everything and supervise until shutdown. Returns a process exit code.
-    pub fn run(&mut self) -> i32 {
-        let order = match self.cfg.start_order() {
+    /// Start and supervise processes. With `roots` empty, start every process;
+    /// otherwise start only `roots` plus their transitive `depends_on` closure.
+    pub fn run(&mut self, roots: &[String]) -> i32 {
+        let order = if roots.is_empty() {
+            self.cfg.start_order()
+        } else {
+            self.cfg.start_order_from(roots)
+        };
+        let order = match order {
             Ok(o) => o,
             Err(e) => {
                 self.log.system(&format!("config error: {e}"));

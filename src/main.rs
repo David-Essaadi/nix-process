@@ -24,6 +24,8 @@ struct Options {
     tests_attr: String,
     grace: Duration,
     state_path: PathBuf,
+    /// Positional (non-flag) arguments, e.g. the targets passed to `up`.
+    targets: Vec<String>,
 }
 
 fn default_options() -> Options {
@@ -33,6 +35,7 @@ fn default_options() -> Options {
         tests_attr: "tests".to_string(),
         grace: Duration::from_secs(10),
         state_path: PathBuf::from(".nix-process/state.json"),
+        targets: Vec::new(),
     }
 }
 
@@ -60,7 +63,9 @@ fn print_usage() {
         "nix-process — run processes defined in a flake.nix\n\
 \n\
 Usage:\n\
-  nix-process up [flags]          start all processes and supervise them\n\
+  nix-process up [targets...]     start processes and supervise them; with no\n\
+                                  targets, start all, otherwise start the named\n\
+                                  targets plus their dependencies\n\
   nix-process test <name> [flags] bring up a test's services, run it, tear down\n\
   nix-process down [flags]        clean up orphaned processes from a prior run\n\
 \n\
@@ -97,7 +102,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--state" => opts.state_path = PathBuf::from(flag_value(args, &mut i, "--state")?),
-            other => return Err(format!("unknown flag {other:?}")),
+            other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
+            other => opts.targets.push(other.to_string()),
         }
         i += 1;
     }
@@ -131,7 +137,7 @@ fn cmd_up(args: &[String]) -> i32 {
 
     install_signal_handler(&sup, &log, Arc::clone(&state));
 
-    sup.run()
+    sup.run(&opts.targets)
 }
 
 fn cmd_test(args: &[String]) -> i32 {

@@ -157,6 +157,9 @@ impl Config {
         let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
         for root in roots {
+            if !self.processes.contains_key(root) {
+                return Err(format!("no such process {root:?}"));
+            }
             self.visit(root, &mut marks, &mut order)?;
         }
         Ok(order)
@@ -194,4 +197,51 @@ impl Config {
 enum Mark {
     InProgress,
     Done,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a Config from a JSON process map, exercising the same parse path
+    /// as `Config::load`. Graph: ticker -> web -> worker (worker depends on web,
+    /// web depends on ticker).
+    fn sample() -> Config {
+        let json = r#"{
+            "ticker": { "command": "tick" },
+            "web":    { "command": "serve", "depends_on": ["ticker"] },
+            "worker": { "command": "work",  "depends_on": ["web"] }
+        }"#;
+        let processes: BTreeMap<String, Process> = serde_json::from_str(json).unwrap();
+        Config::from_processes(processes).unwrap()
+    }
+
+    #[test]
+    fn subset_pulls_in_transitive_deps_in_order() {
+        let cfg = sample();
+        assert_eq!(
+            cfg.start_order_from(&["worker".to_string()]).unwrap(),
+            vec!["ticker", "web", "worker"]
+        );
+        assert_eq!(
+            cfg.start_order_from(&["web".to_string()]).unwrap(),
+            vec!["ticker", "web"]
+        );
+    }
+
+    #[test]
+    fn leaf_target_starts_only_itself() {
+        let cfg = sample();
+        assert_eq!(
+            cfg.start_order_from(&["ticker".to_string()]).unwrap(),
+            vec!["ticker"]
+        );
+    }
+
+    #[test]
+    fn undefined_target_errors() {
+        let cfg = sample();
+        let err = cfg.start_order_from(&["nope".to_string()]).unwrap_err();
+        assert!(err.contains("nope"), "unexpected error: {err}");
+    }
 }
