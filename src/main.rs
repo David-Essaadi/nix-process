@@ -215,8 +215,14 @@ fn cmd_down(args: &[String]) -> i32 {
     0
 }
 
-/// First SIGINT/SIGTERM → graceful shutdown via an Event. A second one →
+/// First SIGINT/SIGTERM/SIGHUP → graceful shutdown via an Event. A second one →
 /// immediate force-kill of every group and a hard exit.
+///
+/// SIGHUP belongs in that set. Children are spawned with `setsid()`, so they sit
+/// in their own sessions with no controlling terminal, and closing the terminal
+/// delivers SIGHUP to this supervisor alone. Its default action would terminate
+/// us on the spot — before the teardown below can `killpg` anything — leaving
+/// every child alive under init, still holding its ports.
 fn install_signal_handler(sup: &Supervisor, log: &Logger, state: Arc<State>) {
     let tx = sup.event_sender();
     let handles = sup.handles();
@@ -225,6 +231,7 @@ fn install_signal_handler(sup: &Supervisor, log: &Logger, state: Arc<State>) {
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
     ])
     .expect("failed to install signal handler");
 

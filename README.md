@@ -12,8 +12,9 @@ A small, TUI-less process manager for services defined in a `flake.nix` — like
 - Waits for each service to become healthy (TCP port / HTTP / custom command)
   before starting the things that `depends_on` it.
 - Streams interleaved, name-prefixed, color-coded stdout/stderr — no TUI.
-- Guarantees shutdown: on Ctrl-C every group gets `SIGTERM`, and anything still
-  alive after a grace period gets `SIGKILL`. A second Ctrl-C force-kills now.
+- Guarantees shutdown: on Ctrl-C — or on closing the terminal — every group gets
+  `SIGTERM`, and anything still alive after a grace period gets `SIGKILL`. A
+  second Ctrl-C force-kills now.
 - Recovers from a previous crash: each child's pgid is written to a state file;
   the next `up` reaps any orphaned groups left behind (guarding against PID
   reuse via the process start time in `/proc`).
@@ -155,9 +156,13 @@ nix build            # produces ./result/bin/nix-process
 
 ## How shutdown & recovery work
 
-- Every child is started with `setpgid(0,0)` so it leads its own process group.
-- On the first `SIGINT`/`SIGTERM`, the supervisor sends each group its
+- Every child is started with `setsid()` so it leads its own session and process
+  group.
+- On the first `SIGINT`/`SIGTERM`/`SIGHUP`, the supervisor sends each group its
   `shutdown_signal`, waits up to `--grace-seconds`, then `SIGKILL`s survivors.
+  `SIGHUP` is handled because the children have no controlling terminal: closing
+  the terminal hangs up this supervisor only, and the default action would kill
+  it before it could tear anything down.
 - A second signal immediately `SIGKILL`s every group and exits `130`.
 - The state file (`.nix-process/state.json`) records each child's `pid`, `pgid`
   and start-time. A later `up`/`down` reads any stale file and kills leftover
