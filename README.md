@@ -17,7 +17,10 @@ A small, TUI-less process manager for services defined in a `flake.nix` — like
   second Ctrl-C force-kills now.
 - Recovers from a previous crash: each child's pgid is written to a state file;
   the next `up` reaps any orphaned groups left behind (guarding against PID
-  reuse via the process start time in `/proc`).
+  reuse via the process start time in `/proc`). A run that is still alive is
+  left alone — only genuine wreckage is reaped.
+- Shares with a running `up`: `nix-process test` reuses any service already
+  running there instead of starting its own, and leaves it running.
 
 The flake is evaluated **impurely** (`nix eval … --impure`), so your `processes`
 and `tests` may branch on the environment — e.g. `builtins.getEnv "CI"` to add
@@ -112,11 +115,35 @@ tests.backend = {
 nix-process test backend       # db up → mix test → db down; exits with mix's code
 ```
 
+### Running a test while `up` is running
+
+A test never disturbs a live `up`. Any service the test needs that `up` is
+already running is **reused in place**: not started a second time, and still
+running once the test finishes. Only services the test had to start itself are
+torn down.
+
+```sh
+nix-process up                 # terminal 1: db, web, worker
+nix-process test backend       # terminal 2: reuses db, runs mix test, leaves db up
+```
+
+Reuse is still health-gated — the test waits on the running service's own health
+check, so it cannot race a service `up` began booting a moment earlier. Oneshots
+are the exception: they are re-run rather than reused, because a oneshot signals
+readiness by exiting and a second supervisor cannot wait on that. They are
+idempotent setup steps, so re-running one is both cheap and correct.
+
+`up` and `test` keep separate state files for this reason, and a state file
+belonging to a supervisor that is still alive is never reaped — see
+[How shutdown & recovery work](#how-shutdown--recovery-work).
+
 ## Usage
 
 ```
 nix-process up [flags]           start all processes and supervise them
-nix-process test <name> [flags]  bring up a test's services, run it, tear down
+nix-process test <name> [flags]  bring up a test's services, run it, tear down;
+                                 services already running under `up` are reused
+                                 and left running
 nix-process down [flags]         clean up orphaned processes from a prior run
 
 Flags:
@@ -124,7 +151,8 @@ Flags:
   --attr <attr>      attribute holding the process map (default "processes")
   --tests-attr <a>   attribute holding the test map (default "tests")
   --grace-seconds N  seconds to wait after SIGTERM before SIGKILL (default 10)
-  --state <path>     state file path (default ".nix-process/state.json")
+  --state <path>     state file path (default ".nix-process/state.json" for
+                     `up`, ".nix-process/test-state.json" for `test`)
 ```
 
 Run it from your flake directory:
@@ -164,7 +192,16 @@ nix build            # produces ./result/bin/nix-process
   the terminal hangs up this supervisor only, and the default action would kill
   it before it could tear anything down.
 - A second signal immediately `SIGKILL`s every group and exits `130`.
-- The state file (`.nix-process/state.json`) records each child's `pid`, `pgid`
-  and start-time. A later `up`/`down` reads any stale file and kills leftover
-  groups, skipping entries whose PID has been recycled.
+- The state file records each child's `pid`, `pgid` and start-time, plus the
+  supervisor's own pid and start-time. A later `up`/`down` reads any stale file
+  and kills leftover groups, skipping entries whose PID has been recycled.
+- **A file whose supervisor is still alive is never reaped.** Staleness is
+  verified, not assumed: the recorded supervisor pid must either be gone or have
+  a different start-time (PID reuse) before anything is killed. Without that
+  check, starting a second command in a directory where `up` was running would
+  mistake the live run for wreckage and terminate it.
+- `up` and `test` therefore also use different files
+  (`.nix-process/state.json` and `.nix-process/test-state.json`), so a test run
+  neither reaps nor overwrites the record a live `up` needs for its own
+  teardown. `down` with no `--state` cleans both.
 ```

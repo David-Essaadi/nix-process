@@ -25,6 +25,11 @@ pub struct ProcState {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Snapshot {
     supervisor_pid: i32,
+    /// Start time of the supervisor itself, same units and purpose as
+    /// `ProcState::start_ticks`. Absent in files written by older versions,
+    /// which is why liveness falls back to the bare PID check.
+    #[serde(default)]
+    supervisor_start_ticks: u64,
     processes: BTreeMap<String, ProcState>,
 }
 
@@ -36,10 +41,12 @@ pub struct State {
 
 impl State {
     pub fn new(path: impl Into<PathBuf>) -> State {
+        let pid = std::process::id() as i32;
         State {
             path: path.into(),
             inner: Mutex::new(Snapshot {
-                supervisor_pid: std::process::id() as i32,
+                supervisor_pid: pid,
+                supervisor_start_ticks: read_start_ticks(pid).unwrap_or(0),
                 processes: BTreeMap::new(),
             }),
         }
@@ -88,9 +95,41 @@ fn flush(path: &Path, snap: &Snapshot) {
     }
 }
 
+/// Is the supervisor that wrote this snapshot still running?
+///
+/// The start-time comparison is what makes this safe: a bare `/proc/<pid>`
+/// check would be fooled by PID reuse into believing a long-dead supervisor is
+/// alive. A snapshot from an older version carries no start time, so the PID
+/// check stands alone there — erring toward "alive", since wrongly reaping a
+/// live run costs the user their whole stack while wrongly keeping orphans
+/// costs them one `nix-process down`.
+fn supervisor_alive(snap: &Snapshot) -> bool {
+    if snap.supervisor_pid <= 0 {
+        return false;
+    }
+    match read_start_ticks(snap.supervisor_pid) {
+        None => false,
+        Some(cur) => snap.supervisor_start_ticks == 0 || cur == snap.supervisor_start_ticks,
+    }
+}
+
+/// The processes recorded by a supervisor that is *still running*, keyed by
+/// name. `None` when the file is absent, unparseable, or was left behind by a
+/// supervisor that has since exited — i.e. whenever there is nothing live to
+/// share.
+pub fn live_run(path: &Path) -> Option<BTreeMap<String, ProcState>> {
+    let snap: Snapshot = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    if supervisor_alive(&snap) {
+        Some(snap.processes)
+    } else {
+        None
+    }
+}
+
 /// Read a leftover state file and kill any process groups still alive. This is
 /// the self-healing path for when a previous supervisor was SIGKILLed and never
-/// got to clean up. Always removes the file afterward.
+/// got to clean up. Removes the file afterward, unless it belongs to a
+/// supervisor that is still running.
 pub fn recover_orphans(path: &Path, log: &Logger) {
     let data = match fs::read(path) {
         Ok(d) => d,
@@ -107,6 +146,15 @@ pub fn recover_orphans(path: &Path, log: &Logger) {
             return;
         }
     };
+
+    if supervisor_alive(&snap) {
+        log.system(&format!(
+            "a nix-process supervisor (pid {}) is still running; leaving its {} process group(s) and state file alone",
+            snap.supervisor_pid,
+            snap.processes.len()
+        ));
+        return;
+    }
 
     if snap.processes.is_empty() {
         let _ = fs::remove_file(path);

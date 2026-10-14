@@ -50,6 +50,9 @@ pub struct Supervisor {
     cancel: Arc<AtomicBool>,
     procs: Handles,
     shutting_down: bool,
+    /// Services that are already running under someone else's supervision.
+    /// Used, never managed: not spawned, not recorded, not torn down.
+    adopted: HashSet<String>,
 }
 
 /// Outcome of processing a single event.
@@ -73,7 +76,13 @@ impl Supervisor {
             cancel: Arc::new(AtomicBool::new(false)),
             procs: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: false,
+            adopted: HashSet::new(),
         }
+    }
+
+    /// Declare services that are already running and must be left that way.
+    pub fn adopt(&mut self, names: HashSet<String>) {
+        self.adopted = names;
     }
 
     /// Clone of the event sender, for the signal-handling thread.
@@ -129,13 +138,38 @@ impl Supervisor {
                 }
             }
 
-            if let Err(e) = self.spawn_process(&p) {
+            if self.adopted.contains(name) {
+                self.watch_adopted(&p);
+            } else if let Err(e) = self.spawn_process(&p) {
                 self.log.system(&format!("failed to start {name:?}: {e}"));
                 self.shutdown();
                 return Err(1);
             }
         }
         Ok(())
+    }
+
+    /// Wait on an already-running service's health check without owning it.
+    ///
+    /// Readiness still comes from the probe rather than being assumed, so a
+    /// test cannot race a service that `up` started moments ago and is still
+    /// booting. Nothing is recorded in `procs`, which is what keeps `shutdown`
+    /// from signalling a process group this run did not create.
+    fn watch_adopted(&self, p: &Process) {
+        self.log
+            .system(&format!("reusing already-running {}", p.name));
+        let tx = self.tx.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let pc = p.clone();
+        thread::spawn(move || match wait_healthy(&pc, &cancel) {
+            Ok(()) => {
+                let _ = tx.send(Event::Healthy(pc.name));
+            }
+            Err(e) if e == "cancelled" => {}
+            Err(e) => {
+                let _ = tx.send(Event::HealthFailed(pc.name, e));
+            }
+        });
     }
 
     /// Start everything and supervise until shutdown. Returns a process exit code.

@@ -9,21 +9,30 @@ mod supervisor;
 
 use crate::config::{load_tests, Config};
 use crate::log::Logger;
-use crate::proc::killpg;
-use crate::state::{recover_orphans, State};
+use crate::proc::{killpg, pgid_alive};
+use crate::state::{live_run, recover_orphans, State};
 use crate::supervisor::{Event, Supervisor};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// State file owned by `up`. A `test` run never writes here, so running a test
+/// cannot disturb the record a live `up` depends on for its own teardown.
+const UP_STATE: &str = ".nix-process/state.json";
+
+/// State file owned by `test`, kept separate from `UP_STATE` for the same reason.
+const TEST_STATE: &str = ".nix-process/test-state.json";
 
 struct Options {
     flake: String,
     attr: String,
     tests_attr: String,
     grace: Duration,
-    state_path: PathBuf,
+    /// `None` until `--state` is given, so each command can apply its own default.
+    state_path: Option<PathBuf>,
     /// Positional (non-flag) arguments, e.g. the targets passed to `up`.
     targets: Vec<String>,
 }
@@ -34,7 +43,7 @@ fn default_options() -> Options {
         attr: "processes".to_string(),
         tests_attr: "tests".to_string(),
         grace: Duration::from_secs(10),
-        state_path: PathBuf::from(".nix-process/state.json"),
+        state_path: None,
         targets: Vec::new(),
     }
 }
@@ -66,7 +75,9 @@ Usage:\n\
   nix-process up [targets...]     start processes and supervise them; with no\n\
                                   targets, start all, otherwise start the named\n\
                                   targets plus their dependencies\n\
-  nix-process test <name> [flags] bring up a test's services, run it, tear down\n\
+  nix-process test <name> [flags] bring up a test's services, run it, tear down;\n\
+                                  services already running under `up` are reused\n\
+                                  and left running\n\
   nix-process down [flags]        clean up orphaned processes from a prior run\n\
 \n\
 Flags:\n\
@@ -74,7 +85,8 @@ Flags:\n\
   --attr <attr>      attribute holding the process map (default \"processes\")\n\
   --tests-attr <a>   attribute holding the test map (default \"tests\")\n\
   --grace-seconds N  seconds to wait after SIGTERM before SIGKILL (default 10)\n\
-  --state <path>     state file path (default \".nix-process/state.json\")\n"
+  --state <path>     state file path (default \".nix-process/state.json\" for\n\
+                     `up`, \".nix-process/test-state.json\" for `test`)\n"
     );
 }
 
@@ -101,7 +113,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                         .map_err(|_| format!("invalid --grace-seconds {v:?}"))?,
                 );
             }
-            "--state" => opts.state_path = PathBuf::from(flag_value(args, &mut i, "--state")?),
+            "--state" => {
+                opts.state_path = Some(PathBuf::from(flag_value(args, &mut i, "--state")?))
+            }
             other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
             other => opts.targets.push(other.to_string()),
         }
@@ -119,9 +133,10 @@ fn cmd_up(args: &[String]) -> i32 {
         }
     };
     let log = Logger::new();
+    let state_path = opts.state_path.clone().unwrap_or_else(|| UP_STATE.into());
 
     // Self-heal: reap orphans from any previously crashed run before starting new ones.
-    recover_orphans(&opts.state_path, &log);
+    recover_orphans(&state_path, &log);
 
     log.system(&format!("evaluating {}#{}", opts.flake, opts.attr));
     let cfg = match Config::load(&opts.flake, &opts.attr) {
@@ -132,7 +147,7 @@ fn cmd_up(args: &[String]) -> i32 {
         }
     };
 
-    let state = Arc::new(State::new(opts.state_path.clone()));
+    let state = Arc::new(State::new(state_path));
     let mut sup = Supervisor::new(cfg, Arc::clone(&state), log.clone(), opts.grace);
 
     install_signal_handler(&sup, &log, Arc::clone(&state));
@@ -157,9 +172,11 @@ fn cmd_test(args: &[String]) -> i32 {
         }
     };
     let log = Logger::new();
+    let state_path = opts.state_path.clone().unwrap_or_else(|| TEST_STATE.into());
 
-    // Self-heal: reap orphans from any previously crashed run first.
-    recover_orphans(&opts.state_path, &log);
+    // Self-heal: reap orphans from a previously crashed *test* run. The `up`
+    // state file is deliberately not touched here.
+    recover_orphans(&state_path, &log);
 
     let cfg = match Config::load(&opts.flake, &opts.attr) {
         Ok(c) => c,
@@ -194,11 +211,36 @@ fn cmd_test(args: &[String]) -> i32 {
         }
     };
 
-    let state = Arc::new(State::new(opts.state_path.clone()));
+    let adopted = already_running(&cfg, &order);
+
+    let state = Arc::new(State::new(state_path));
     let mut sup = Supervisor::new(cfg, Arc::clone(&state), log.clone(), opts.grace);
+    sup.adopt(adopted);
     install_signal_handler(&sup, &log, Arc::clone(&state));
 
     sup.run_test(order, &test)
+}
+
+/// Of the services this test needs, which are already running under a live
+/// `up`? Those get reused instead of started, and are left running afterward.
+///
+/// Oneshots are never adopted: readiness for a oneshot is its own exit, which
+/// a second supervisor cannot wait on, and they are idempotent setup steps by
+/// design — re-running one is both cheap and correct.
+fn already_running(cfg: &Config, order: &[String]) -> HashSet<String> {
+    let Some(running) = live_run(Path::new(UP_STATE)) else {
+        return HashSet::new();
+    };
+    order
+        .iter()
+        .filter(|name| {
+            cfg.processes.get(*name).is_some_and(|p| !p.oneshot)
+                && running
+                    .get(*name)
+                    .is_some_and(|ps| ps.pgid > 0 && pgid_alive(ps.pgid))
+        })
+        .cloned()
+        .collect()
 }
 
 fn cmd_down(args: &[String]) -> i32 {
@@ -210,7 +252,13 @@ fn cmd_down(args: &[String]) -> i32 {
         }
     };
     let log = Logger::new();
-    recover_orphans(&opts.state_path, &log);
+    match &opts.state_path {
+        Some(path) => recover_orphans(path, &log),
+        None => {
+            recover_orphans(Path::new(UP_STATE), &log);
+            recover_orphans(Path::new(TEST_STATE), &log);
+        }
+    }
     log.system("cleanup complete");
     0
 }
